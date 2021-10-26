@@ -382,6 +382,7 @@ consensus_failure_members() ->
                     fun(Txn) ->
                         %% Update fields for each affected txn
                         TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
+                        TxnJson = be_txn:to_json(Txn, JsonOpts),
                         {ok, _} = ?EQUERY(
                             [
                                 "update transactions ",
@@ -391,7 +392,7 @@ consensus_failure_members() ->
                             [
                                 TxnHash,
                                 Height,
-                                be_txn:to_json(Txn, JsonOpts)
+                                TxnJson
                             ]
                         ),
                         %% Remove old actors
@@ -403,8 +404,14 @@ consensus_failure_members() ->
                             [TxnHash, Height]
                         ),
                         %% Re-insert actors
+                        TxnJsonFun = fun(_) -> TxnJson end,
                         ActorQueries =
-                            be_db_txn_actor:q_insert_transaction_actors(Height, Txn, []),
+                            be_db_txn_actor:q_insert_transaction_actors(
+                                Height,
+                                Txn,
+                                TxnJsonFun,
+                                []
+                            ),
                         ok = ?BATCH_QUERY(Conn, ActorQueries)
                     end,
                     Txns

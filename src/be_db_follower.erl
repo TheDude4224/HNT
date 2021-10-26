@@ -40,6 +40,7 @@
 ]).
 
 -define(HANDLER_MODULES, [
+    %% ensure be_db_block is always first
     be_db_block,
     be_db_txn_actor,
     be_db_account,
@@ -132,7 +133,10 @@ fold_actors(Roles, Fun, InitAcc, Block) ->
         end,
     ActorList = lists:usort(
         lists:flatten(
-            lists:map(fun(Txn) -> FilteredActors(be_db_txn_actor:to_actors(Txn)) end, Txns)
+            lists:map(
+                fun(Txn) -> FilteredActors(be_db_txn_actor:txn_actors(Txn, undefined)) end,
+                Txns
+            )
         )
     ),
     lists:foldl(fun({Role, Key}, Acc) -> Fun({Role, Key}, Acc) end, InitAcc, ActorList).

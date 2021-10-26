@@ -12,12 +12,14 @@
 %% be_block_handler
 -export([init/1, load_block/6]).
 %% api
--export([block_height/1, maybe_write_snapshot/2]).
+-export([block_height/1, maybe_write_snapshot/2, txn_json/1]).
 
 -define(S_BLOCK_HEIGHT, "block_height").
 -define(S_INSERT_BLOCK, "insert_block").
 -define(S_INSERT_BLOCK_SIG, "insert_block_signature").
 -define(S_INSERT_TXN, "insert_transaction").
+
+-define(TXN_JSON_CACHE, txn_json_cache).
 
 -record(state, {
     height :: non_neg_integer(),
@@ -80,6 +82,7 @@ prepare_conn(Conn) ->
 %%
 
 init(_) ->
+    ets:new(?TXN_JSON_CACHE, [public, named_table]),
     {ok, _, [{Value}]} = ?PREPARED_QUERY(?S_BLOCK_HEIGHT, []),
     Height =
         case Value of
@@ -142,8 +145,10 @@ maybe_write_snapshot(Height, SnapshotHash, SnapshotDir, Chain) ->
             {error, not_found} -> blockchain:get_snapshot(Height, Chain);
             Other -> Other
         end,
-    LatestBin = jsone:encode(#{height => Height,
-                               hash => base64url:encode(SnapshotHash)}),
+    LatestBin = jsone:encode(#{
+        height => Height,
+        hash => base64url:encode(SnapshotHash)
+    }),
     Latest = filename:join([SnapshotDir, "latest-snap.json"]),
     Filename = filename:join([SnapshotDir, io_lib:format("snap-~p", [Height])]),
     ok = file:write_file(Filename, BinSnap),
@@ -200,16 +205,19 @@ q_insert_transactions(Block, Queries, Ledger, #state{}) ->
     Time = blockchain_block_v1:time(Block),
     Txns = blockchain_block_v1:transactions(Block),
     JsonOpts = [{ledger, Ledger}, {chain, blockchain_worker:blockchain()}],
+    ets:delete_all_objects(?TXN_JSON_CACHE),
     lists:foldl(
         fun(T, Acc) ->
-            Json = #{type := Type} = be_txn:to_json(T, JsonOpts),
+            TxnHash = blockchain_txn:hash(T),
+            TxnJson = #{type := Type} = be_txn:to_json(T, JsonOpts),
+            ets:insert(?TXN_JSON_CACHE, {TxnHash, TxnJson}),
             [
                 {?S_INSERT_TXN, [
                     Height,
                     Time,
-                    ?BIN_TO_B64(blockchain_txn:hash(T)),
+                    ?BIN_TO_B64(TxnHash),
                     Type,
-                    Json
+                    TxnJson
                 ]}
                 | Acc
             ]
@@ -217,3 +225,10 @@ q_insert_transactions(Block, Queries, Ledger, #state{}) ->
         Queries,
         Txns
     ).
+
+-spec txn_json(TxnHash :: binary()) -> Json :: map() | undefined.
+txn_json(TxnHash) ->
+    case ets:lookup(?TXN_JSON_CACHE, TxnHash) of
+        [{_, Json}] -> Json;
+        _ -> undefined
+    end.

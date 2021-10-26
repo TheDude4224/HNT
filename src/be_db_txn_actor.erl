@@ -13,7 +13,7 @@
 %% be_block_handler
 -export([init/1, load_block/6]).
 %% api
--export([to_actors/1, q_insert_transaction_actors/3]).
+-export([txn_actors/2, q_insert_transaction_actors/4]).
 
 -define(S_INSERT_ACTOR, "insert_actor").
 
@@ -48,11 +48,11 @@ init(_) ->
     {ok, #state{}}.
 
 load_block(Conn, _Hash, Block, _Sync, _Ledger, State = #state{}) ->
-    Queries = q_insert_block_transaction_actors(Block, []),
+    Queries = q_insert_block_transaction_actors(Block, fun be_db_block:txn_json/1, []),
     ok = ?BATCH_QUERY(Conn, Queries),
     {ok, State}.
 
-q_insert_transaction_actors(Height, Txn, Acc) ->
+q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc) ->
     TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
     lists:foldl(
         fun({Role, Key}, ActorAcc) ->
@@ -62,23 +62,97 @@ q_insert_transaction_actors(Height, Txn, Acc) ->
             ]
         end,
         Acc,
-        to_actors(Txn)
+        txn_actors(Txn, TxnJsonFun)
     ).
 
-q_insert_block_transaction_actors(Block, Query) ->
+q_insert_block_transaction_actors(Block, TxnJsonFun, Queries) ->
     Height = blockchain_block_v1:height(Block),
     Txns = blockchain_block_v1:transactions(Block),
     lists:foldl(
         fun(Txn, Acc) ->
-            q_insert_transaction_actors(Height, Txn, Acc)
+            q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc)
         end,
-        Query,
+        Queries,
         Txns
     ).
 
--spec to_actors(blockchain_txn:txn()) -> [{string(), libp2p_crypto:pubkey_bin()}].
-to_actors(T) ->
-    to_actors(blockchain_txn:type(T), T).
+-spec txn_actors(
+    blockchain_txn:txn(),
+    TxnJsonFun :: fun((TxnHash :: binary()) -> TxnJson :: map()) | undefined
+) ->
+    [
+        {ActorType :: string(), ActorAddress :: libp2p_crypto:pubkey_bin()}
+        | {ActorType :: string(), ActorAddress :: libp2p_crypto:pubkey_bin(), Fields :: map()}
+    ].
+txn_actors(T, TxnJsonFun) ->
+    TxnType = blockchain_txn:type(T),
+    TxnHash = blockchain_txn:hash(T),
+    %% This is a terrible side effect hack which looks up the json that the
+    %% be_db_block constructed. For pending transactions this should always be
+    %% undefined which is fine as it's translated to null in the database
+    TxnActors = to_actors(TxnType, T),
+    case TxnJsonFun of
+        undefined ->
+            TxnActors;
+        _ ->
+            TxnJson = TxnJsonFun(TxnHash),
+            lists:map(
+                fun({Type, Address}) ->
+                    {Type, Address, to_actor_fields(TxnType, Address, TxnJson)}
+                end,
+                TxnActors
+            )
+    end.
+
+to_actor_fields(Type, Actor, Fields) when
+    Type == blockchain_txn_reward_v1 orelse Type == blockchain_txn_rewards_v2
+->
+    Rewards = lists:foldl(
+        fun
+            (Reward = #{<<"account">> := Account}, Acc) when Account == Actor ->
+                [Reward | Acc];
+            (Reward = #{<<"gateway">> := Gateway}, Acc) when Gateway == Actor ->
+                [Reward | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        maps:get(<<"rewards">>, Fields, [])
+    ),
+    Fields#{<<"rewards">> => lists:reverse(Rewards)};
+to_actor_fields(blockchain_txn_state_channel_close_v1, Actor, Fields) ->
+    StateChannel = maps:get(<<"state_channel">>, Fields, #{}),
+    Summaries = lists:foldl(
+        fun
+            (Summary = #{<<"owner">> := Owner}, Acc) when Owner == Actor ->
+                [Summary | Acc];
+            (Summary = #{<<"client">> := Client}, Acc) when Client == Actor ->
+                [Summary | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        maps:get(<<"summaries">>, StateChannel, [])
+    ),
+    Fields#{<<"state_channel">> => StateChannel#{<<"summaries">> => lists:reverse(Summaries)}};
+to_actor_fields(blockchain_txn_payment_v2, Actor, Fields = #{<<"payer">> := Payer}) when
+    Payer == Actor
+->
+    Fields;
+to_actor_fields(blockchain_txn_payment_v2, Actor, Fields) ->
+    Payments = lists:foldl(
+        fun
+            (Payment = #{<<"payee">> := Payee}, Acc) when Payee == Actor ->
+                [Payment | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        maps:get(<<"payments">>, Fields, [])
+    ),
+    Fields#{<<"payments">> => lists:reverse(Payments)};
+to_actor_fields(_, _Actor, Fields) ->
+    Fields.
 
 to_actors(blockchain_txn_coinbase_v1, T) ->
     [{"payee", blockchain_txn_coinbase_v1:payee(T)}];
