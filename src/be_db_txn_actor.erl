@@ -13,7 +13,7 @@
 %% be_block_handler
 -export([init/1, load_block/6]).
 %% api
--export([txn_actors/2, q_insert_transaction_actors/4]).
+-export([txn_actors/2, q_insert_transaction_actors/3]).
 
 -define(S_INSERT_ACTOR, "insert_actor").
 
@@ -48,33 +48,31 @@ init(_) ->
     {ok, #state{}}.
 
 load_block(Conn, _Hash, Block, _Sync, _Ledger, State = #state{}) ->
-    Queries = q_insert_block_transaction_actors(Block, fun be_db_block:txn_json/1, []),
+    Queries = q_insert_block_transaction_actors(Block, fun be_db_block:txn_json/1),
     ok = ?BATCH_QUERY(Conn, Queries),
     {ok, State}.
 
-q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc) ->
+q_insert_transaction_actors(Height, Txn, TxnJsonFun) ->
     TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
-    lists:foldl(
-        fun({Role, Address, Fields}, ActorAcc) ->
+    lists:map(
+        fun({Role, Address, Fields}) ->
             [
                 {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Address), Role, TxnHash, Fields]}
-                | ActorAcc
             ]
         end,
-        Acc,
         txn_actors(Txn, TxnJsonFun)
     ).
 
-q_insert_block_transaction_actors(Block, TxnJsonFun, Queries) ->
+q_insert_block_transaction_actors(Block, TxnJsonFun) ->
     Height = blockchain_block_v1:height(Block),
     Txns = blockchain_block_v1:transactions(Block),
-    lists:foldl(
-        fun(Txn, Acc) ->
-            q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc)
+    TxnQueries = blockchain_utils:pmap(
+        fun(Txn) ->
+            q_insert_transaction_actors(Height, Txn, TxnJsonFun)
         end,
-        Queries,
         Txns
-    ).
+    ),
+    lists:flatten(TxnQueries).
 
 -spec txn_actors(
     blockchain_txn:txn(),

@@ -409,8 +409,7 @@ consensus_failure_members() ->
                             be_db_txn_actor:q_insert_transaction_actors(
                                 Height,
                                 Txn,
-                                TxnJsonFun,
-                                []
+                                TxnJsonFun
                             ),
                         ok = ?BATCH_QUERY(Conn, ActorQueries)
                     end,
