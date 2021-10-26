@@ -55,9 +55,9 @@ load_block(Conn, _Hash, Block, _Sync, _Ledger, State = #state{}) ->
 q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc) ->
     TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
     lists:foldl(
-        fun({Role, Key, Fields}, ActorAcc) ->
+        fun({Role, Address, Fields}, ActorAcc) ->
             [
-                {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Key), Role, TxnHash, Fields]}
+                {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Address), Role, TxnHash, Fields]}
                 | ActorAcc
             ]
         end,
@@ -81,8 +81,8 @@ q_insert_block_transaction_actors(Block, TxnJsonFun, Queries) ->
     TxnJsonFun :: fun((TxnHash :: binary()) -> TxnJson :: map()) | undefined
 ) ->
     [
-        {ActorType :: string(), ActorAddress :: libp2p_crypto:pubkey_bin()}
-        | {ActorType :: string(), ActorAddress :: libp2p_crypto:pubkey_bin(), Fields :: map()}
+        {Role :: string(), Address :: libp2p_crypto:pubkey_bin()}
+        | {Role :: string(), Address :: libp2p_crypto:pubkey_bin(), Fields :: map()}
     ].
 txn_actors(T, TxnJsonFun) ->
     TxnType = blockchain_txn:type(T),
@@ -97,8 +97,8 @@ txn_actors(T, TxnJsonFun) ->
         _ ->
             TxnJson = TxnJsonFun(TxnHash),
             lists:map(
-                fun({Type, Address}) ->
-                    {Type, Address, to_actor_fields(TxnType, Address, TxnJson)}
+                fun({Role, Address}) ->
+                    {Role, Address, to_actor_fields(TxnType, Address, TxnJson)}
                 end,
                 TxnActors
             )
