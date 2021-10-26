@@ -29,8 +29,8 @@ prepare_conn(Conn) ->
             Conn,
             ?S_INSERT_ACTOR,
             [
-                "insert into transaction_actors (block, actor, actor_role, transaction_hash) ",
-                "values ($1, $2, $3, $4) ",
+                "insert into transaction_actors (block, actor, actor_role, transaction_hash, fields) ",
+                "values ($1, $2, $3, $4, $5) ",
                 "on conflict do nothing"
             ],
             []
@@ -55,9 +55,9 @@ load_block(Conn, _Hash, Block, _Sync, _Ledger, State = #state{}) ->
 q_insert_transaction_actors(Height, Txn, TxnJsonFun, Acc) ->
     TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
     lists:foldl(
-        fun({Role, Key}, ActorAcc) ->
+        fun({Role, Key, Fields}, ActorAcc) ->
             [
-                {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Key), Role, TxnHash]}
+                {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Key), Role, TxnHash, Fields]}
                 | ActorAcc
             ]
         end,
