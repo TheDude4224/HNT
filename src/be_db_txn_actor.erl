@@ -151,6 +151,24 @@ to_actor_fields(blockchain_txn_payment_v2, Actor, Fields) ->
         maps:get(<<"payments">>, Fields, [])
     ),
     Fields#{<<"payments">> => lists:reverse(Payments)};
+to_actor_fields(blockchain_txn_poc_receipts_v1, Actor, Fields) ->
+    %% strip out secret to save some space and filter witnesses based on either owner or gateway
+    Path = lists:map(
+        fun(PathEntry) ->
+            Witnesses = lists:filter(
+                fun
+                    (#{<<"owner">> := Owner, <<"gateway">> := Gateway}) ->
+                        Owner == Actor orelse Gateway == Actor;
+                    (_) ->
+                        false
+                end,
+                maps:get(<<"witnesses">>, PathEntry, [])
+            ),
+            PathEntry#{<<"witnesses">> => Witnesses}
+        end,
+        maps:get(<<"path">>, Fields, [])
+    ),
+    maps:remove(<<"secret">>, Fields#{<<"path">> => Path});
 to_actor_fields(_, _Actor, Fields) ->
     Fields.
 
