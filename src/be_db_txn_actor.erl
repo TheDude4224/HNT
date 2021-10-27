@@ -57,7 +57,7 @@ q_insert_transaction_actors(Height, Txn, TxnJsonFun) ->
     lists:map(
         fun({Role, Address, Fields}) ->
             [
-                {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Address), Role, TxnHash, Fields]}
+                {?S_INSERT_ACTOR, [Height, Address, Role, TxnHash, Fields]}
             ]
         end,
         txn_actors(Txn, TxnJsonFun)
@@ -86,127 +86,136 @@ txn_actors(T, TxnJsonFun) ->
     TxnType = blockchain_txn:type(T),
     TxnHash = blockchain_txn:hash(T),
     %% This is a terrible side effect hack which looks up the json that the
-    %% be_db_block constructed. For pending transactions this should always be
-    %% undefined which is fine as it's translated to null in the database
+    %% be_db_block constructed.
     TxnActors = to_actors(TxnType, T),
     case TxnJsonFun of
         undefined ->
             TxnActors;
         _ ->
             TxnJson = TxnJsonFun(TxnHash),
+            TxnFieldsCtx = prepare_actor_fields_ctx(TxnType, TxnJson),
             lists:map(
                 fun({Role, Address}) ->
-                    {Role, Address, to_actor_fields(TxnType, Address, TxnJson)}
+                    {Role, Address, to_actor_fields(TxnType, Role, Address, TxnJson, TxnFieldsCtx)}
                 end,
                 TxnActors
             )
     end.
 
-to_actor_fields(Type, Actor, Fields) when
+prepare_actor_fields_ctx(Type, #{<<"rewards">> := Rewards}) when
     Type == blockchain_txn_reward_v1 orelse Type == blockchain_txn_rewards_v2
 ->
-    Rewards = lists:foldl(
-        fun
-            (Reward = #{<<"account">> := Account}, Acc) when Account == Actor ->
-                [Reward | Acc];
-            (Reward = #{<<"gateway">> := Gateway}, Acc) when Gateway == Actor ->
-                [Reward | Acc];
-            (_, Acc) ->
-                Acc
+    {Gateways, Accounts} = lists:foldl(
+        fun(Reward, {GatewayAcc, AccountAcc}) ->
+            GWAcc =
+                case maps:get(<<"gateway">>, Reward, undefined) of
+                    undefined ->
+                        GatewayAcc;
+                    Gateway ->
+                        maps:update_with(Gateway, fun(X) -> [Reward | X] end, [Reward], GatewayAcc)
+                end,
+            ACAcc =
+                case maps:get(<<"acccount">>, Reward, undefined) of
+                    undefined ->
+                        AccountAcc;
+                    Account ->
+                        maps:update_with(Account, fun(X) -> [Reward | X] end, [Reward], AccountAcc)
+                end,
+            {GWAcc, ACAcc}
         end,
-        [],
-        maps:get(<<"rewards">>, Fields, [])
+        {[], []},
+        Rewards
     ),
-    Fields#{<<"rewards">> => lists:reverse(Rewards)};
-to_actor_fields(blockchain_txn_state_channel_close_v1, Actor, Fields) ->
-    StateChannel = maps:get(<<"state_channel">>, Fields, #{}),
-    Summaries = lists:foldl(
-        fun
-            (Summary = #{<<"owner">> := Owner}, Acc) when Owner == Actor ->
-                [Summary | Acc];
-            (Summary = #{<<"client">> := Client}, Acc) when Client == Actor ->
-                [Summary | Acc];
-            (_, Acc) ->
-                Acc
+    #{gateways => Gateways, accounts => Accounts};
+prepare_actor_fields_ctx(blockchain_txn_state_channel_close_v1, #{
+    <<"state_channel">> := StateChannel
+}) ->
+    Clients = lists:foldl(
+        fun(Summary = #{<<"client">> := Client}, Acc) ->
+            maps:update_with(Client, fun(X) -> [Summary | X] end, [Summary], Acc)
         end,
-        [],
+        #{},
         maps:get(<<"summaries">>, StateChannel, [])
     ),
-    Fields#{<<"state_channel">> => StateChannel#{<<"summaries">> => lists:reverse(Summaries)}};
-to_actor_fields(blockchain_txn_payment_v2, Actor, Fields = #{<<"payer">> := Payer}) when
-    Payer == Actor
-->
-    Fields;
-to_actor_fields(blockchain_txn_payment_v2, Actor, Fields) ->
+    #{clients => Clients};
+prepare_actor_fields_ctx(blockchain_txn_payment_v2, Fields) ->
     Payments = lists:foldl(
-        fun
-            (Payment = #{<<"payee">> := Payee}, Acc) when Payee == Actor ->
-                [Payment | Acc];
-            (_, Acc) ->
-                Acc
+        fun(Payment = #{<<"payee">> := Payee}, Acc) ->
+            maps:update_with(Payee, fun(X) -> [Payment | X] end, [Payment], Acc)
         end,
-        [],
+        #{},
         maps:get(<<"payments">>, Fields, [])
     ),
-    Fields#{<<"payments">> => lists:reverse(Payments)};
-to_actor_fields(blockchain_txn_poc_receipts_v1, Actor, Fields) ->
-    %% strip out secret to save some space and filter witnesses based on either owner or gateway
-    Path = lists:map(
-        fun(PathEntry) ->
-            Witnesses = lists:filter(
-                fun
-                    (#{<<"owner">> := Owner, <<"gateway">> := Gateway}) ->
-                        Owner == Actor orelse Gateway == Actor;
-                    (_) ->
-                        false
-                end,
-                maps:get(<<"witnesses">>, PathEntry, [])
-            ),
-            PathEntry#{<<"witnesses">> => Witnesses}
+    #{payments => Payments};
+prepare_actor_fields_ctx(_Type, _Fields) ->
+    #{}.
+
+to_actor_fields(Type, Role, Actor, Fields, #{gateways := Gateways, accounts := Accounts}) when
+    Type == blockchain_txn_reward_v1 orelse Type == blockchain_txn_rewards_v2
+->
+    Rewards =
+        case Role of
+            "reward_gateway" -> maps:get(Actor, Gateways, []);
+            "payee" -> maps:get(Actor, Accounts, [])
         end,
-        maps:get(<<"path">>, Fields, [])
-    ),
-    maps:remove(<<"secret">>, Fields#{<<"path">> => Path});
-to_actor_fields(_, _Actor, Fields) ->
+    Fields#{<<"rewards">> => Rewards};
+to_actor_fields(blockchain_txn_state_channel_close_v1, Role, Actor, Fields, #{clients := Clients}) ->
+    Summaries =
+        case Role of
+            "packet_receiver" -> maps:get(Actor, Clients, []);
+            _ -> []
+        end,
+    StateChannel = maps:get(<<"state_channel">>, Fields, #{}),
+    Fields#{<<"state_channel">> => StateChannel#{<<"summaries">> => Summaries}};
+to_actor_fields(blockchain_txn_payment_v2, Role, Actor, Fields, #{payments := Payments}) ->
+    Payments =
+        case Role of
+            "payer" -> [];
+            "payee" -> maps:get(Actor, Payments, [])
+        end,
+    Fields#{<<"payments">> => Payments};
+to_actor_fields(_Type, _Role, _Actor, Fields, _Ctx) ->
     Fields.
 
+-spec to_actors(Type :: atom(), Txn :: blockchain_txn:txn()) ->
+    [{Role :: string(), Address :: string()}].
 to_actors(blockchain_txn_coinbase_v1, T) ->
-    [{"payee", blockchain_txn_coinbase_v1:payee(T)}];
+    [{"payee", ?BIN_TO_B58(blockchain_txn_coinbase_v1:payee(T))}];
 to_actors(blockchain_txn_security_coinbase_v1, T) ->
-    [{"payee", blockchain_txn_security_coinbase_v1:payee(T)}];
+    [{"payee", ?BIN_TO_B58(blockchain_txn_security_coinbase_v1:payee(T))}];
 to_actors(blockchain_txn_oui_v1, T) ->
     Routers = [{"router", R} || R <- blockchain_txn_oui_v1:addresses(T)],
     [
-        {"owner", blockchain_txn_oui_v1:owner(T)},
-        {"payer", blockchain_txn_oui_v1:payer(T)}
+        {"owner", ?BIN_TO_B58(blockchain_txn_oui_v1:owner(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_oui_v1:payer(T))}
     ] ++ Routers;
 to_actors(blockchain_txn_gen_gateway_v1, T) ->
     [
-        {"gateway", blockchain_txn_gen_gateway_v1:gateway(T)},
-        {"owner", blockchain_txn_gen_gateway_v1:owner(T)}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_gen_gateway_v1:gateway(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_gen_gateway_v1:owner(T))}
     ];
 to_actors(blockchain_txn_routing_v1, T) ->
     Routers =
         case blockchain_txn_routing_v1:action(T) of
-            {update_routers, Addrs} -> [{"router", R} || R <- Addrs];
+            {update_routers, Addrs} -> [{"router", ?BIN_TO_B58(R)} || R <- Addrs];
             _ -> []
         end,
     [
-        {"owner", blockchain_txn_routing_v1:owner(T)},
-        {"payer", blockchain_txn_routing_v1:owner(T)}
+        {"owner", ?BIN_TO_B58(blockchain_txn_routing_v1:owner(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_routing_v1:owner(T))}
     ] ++ Routers;
 to_actors(blockchain_txn_payment_v1, T) ->
     [
-        {"payer", blockchain_txn_payment_v1:payer(T)},
-        {"payee", blockchain_txn_payment_v1:payee(T)}
+        {"payer", ?BIN_TO_B58(blockchain_txn_payment_v1:payer(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_payment_v1:payee(T))}
     ];
 to_actors(blockchain_txn_security_exchange_v1, T) ->
     [
-        {"payer", blockchain_txn_security_exchange_v1:payer(T)},
-        {"payee", blockchain_txn_security_exchange_v1:payee(T)}
+        {"payer", ?BIN_TO_B58(blockchain_txn_security_exchange_v1:payer(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_security_exchange_v1:payee(T))}
     ];
 to_actors(blockchain_txn_consensus_group_v1, T) ->
-    [{"consensus_member", M} || M <- blockchain_txn_consensus_group_v1:members(T)];
+    [{"consensus_member", ?BIN_TO_B58(M)} || M <- blockchain_txn_consensus_group_v1:members(T)];
 to_actors(blockchain_txn_add_gateway_v1, T) ->
     Owner = blockchain_txn_add_gateway_v1:owner(T),
     Payer =
@@ -216,9 +225,9 @@ to_actors(blockchain_txn_add_gateway_v1, T) ->
             P -> P
         end,
     [
-        {"gateway", blockchain_txn_add_gateway_v1:gateway(T)},
-        {"owner", Owner},
-        {"payer", Payer}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_add_gateway_v1:gateway(T))},
+        {"owner", ?BIN_TO_B58(Owner)},
+        {"payer", ?BIN_TO_B58(Payer)}
     ];
 to_actors(blockchain_txn_assert_location_v1, T) ->
     Owner = blockchain_txn_assert_location_v1:owner(T),
@@ -229,9 +238,9 @@ to_actors(blockchain_txn_assert_location_v1, T) ->
             P -> P
         end,
     [
-        {"gateway", blockchain_txn_assert_location_v1:gateway(T)},
-        {"owner", Owner},
-        {"payer", Payer}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_assert_location_v1:gateway(T))},
+        {"owner", ?BIN_TO_B58(Owner)},
+        {"payer", ?BIN_TO_B58(Payer)}
     ];
 to_actors(blockchain_txn_assert_location_v2, T) ->
     Owner = blockchain_txn_assert_location_v2:owner(T),
@@ -242,35 +251,35 @@ to_actors(blockchain_txn_assert_location_v2, T) ->
             P -> P
         end,
     [
-        {"gateway", blockchain_txn_assert_location_v2:gateway(T)},
-        {"owner", Owner},
-        {"payer", Payer}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_assert_location_v2:gateway(T))},
+        {"owner", ?BIN_TO_B58(Owner)},
+        {"payer", ?BIN_TO_B58(Payer)}
     ];
 to_actors(blockchain_txn_create_htlc_v1, T) ->
     [
-        {"payer", blockchain_txn_create_htlc_v1:payer(T)},
-        {"payee", blockchain_txn_create_htlc_v1:payee(T)},
-        {"escrow", blockchain_txn_create_htlc_v1:address(T)}
+        {"payer", ?BIN_TO_B58(blockchain_txn_create_htlc_v1:payer(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_create_htlc_v1:payee(T))},
+        {"escrow", ?BIN_TO_B58(blockchain_txn_create_htlc_v1:address(T))}
     ];
 to_actors(blockchain_txn_redeem_htlc_v1, T) ->
     [
-        {"payee", blockchain_txn_redeem_htlc_v1:payee(T)},
-        {"escrow", blockchain_txn_redeem_htlc_v1:address(T)}
+        {"payee", ?BIN_TO_B58(blockchain_txn_redeem_htlc_v1:payee(T))},
+        {"escrow", ?BIN_TO_B58(blockchain_txn_redeem_htlc_v1:address(T))}
     ];
 to_actors(blockchain_txn_poc_request_v1, T) ->
-    [{"challenger", blockchain_txn_poc_request_v1:challenger(T)}];
+    [{"challenger", ?BIN_TO_B58(blockchain_txn_poc_request_v1:challenger(T))}];
 to_actors(blockchain_txn_poc_receipts_v1, T) ->
     ToActors = fun
         (undefined, Acc0) ->
             Acc0;
         (Elem, {ChallengeeAcc0, WitnessAcc0}) ->
             ChallengeeAcc = [
-                {"challengee", blockchain_poc_path_element_v1:challengee(Elem)}
+                {"challengee", ?BIN_TO_B58(blockchain_poc_path_element_v1:challengee(Elem))}
                 | ChallengeeAcc0
             ],
             WitnessAcc = lists:foldl(
                 fun(W, WAcc) ->
-                    [{"witness", blockchain_poc_witness_v1:gateway(W)} | WAcc]
+                    [{"witness", ?BIN_TO_B58(blockchain_poc_witness_v1:gateway(W))} | WAcc]
                 end,
                 WitnessAcc0,
                 blockchain_poc_path_element_v1:witnesses(Elem)
@@ -284,16 +293,16 @@ to_actors(blockchain_txn_poc_receipts_v1, T) ->
     ),
     lists:usort(Challengees) ++
         lists:usort(Witnesses) ++
-        [{"challenger", blockchain_txn_poc_receipts_v1:challenger(T)}];
+        [{"challenger", ?BIN_TO_B58(blockchain_txn_poc_receipts_v1:challenger(T))}];
 to_actors(blockchain_txn_vars_v1, _T) ->
     [];
 to_actors(blockchain_txn_rewards_v1, T) ->
     ToActors = fun(R, {PayeeAcc0, GatewayAcc0}) ->
-        PayeeAcc = [{"payee", blockchain_txn_reward_v1:account(R)} | PayeeAcc0],
+        PayeeAcc = [{"payee", ?BIN_TO_B58(blockchain_txn_reward_v1:account(R))} | PayeeAcc0],
         GatewayAcc =
             case blockchain_txn_reward_v1:gateway(R) of
                 undefined -> GatewayAcc0;
-                G -> [{"reward_gateway", G} | GatewayAcc0]
+                G -> [{"reward_gateway", ?BIN_TO_B58(G)} | GatewayAcc0]
             end,
         {PayeeAcc, GatewayAcc}
     end,
@@ -321,21 +330,27 @@ to_actors(blockchain_txn_rewards_v2, T) ->
         maps:fold(
             fun
                 ({owner, _Type, O}, _Amt, {PayeeAcc, GatewayAcc}) ->
-                    {[{"payee", O} | PayeeAcc], GatewayAcc};
+                    {[{"payee", ?BIN_TO_B58(O)} | PayeeAcc], GatewayAcc};
                 ({gateway, _Type, G}, _Amt, {PayeeAcc, GatewayAcc}) ->
                     case blockchain_ledger_v1:find_gateway_owner(G, Ledger) of
                         {error, _Error} ->
-                            {PayeeAcc, [{"reward_gateway", G} | GatewayAcc]};
+                            {PayeeAcc, [{"reward_gateway", ?BIN_TO_B58(G)} | GatewayAcc]};
                         {ok, GwOwner} ->
-                            {[{"payee", GwOwner} | PayeeAcc], [{"reward_gateway", G} | GatewayAcc]}
+                            {[{"payee", ?BIN_TO_B58(GwOwner)} | PayeeAcc], [
+                                {"reward_gateway", ?BIN_TO_B58(G)}
+                                | GatewayAcc
+                            ]}
                     end;
                 ({validator, _Type, V}, _Amt, {PayeeAcc, GatewayAcc}) ->
                     case blockchain_ledger_v1:get_validator(V, Ledger) of
                         {error, _Error} ->
-                            {PayeeAcc, [{"validator", V} | GatewayAcc]};
+                            {PayeeAcc, [{"validator", ?BIN_TO_B58(V)} | GatewayAcc]};
                         {ok, Validator} ->
                             Owner = blockchain_ledger_validator_v1:owner_address(Validator),
-                            {[{"payee", Owner} | PayeeAcc], [{"validator", V} | GatewayAcc]}
+                            {[{"payee", ?BIN_TO_B58(Owner)} | PayeeAcc], [
+                                {"validator", ?BIN_TO_B58(V)}
+                                | GatewayAcc
+                            ]}
                     end
             end,
             Acc,
@@ -356,33 +371,37 @@ to_actors(blockchain_txn_rewards_v2, T) ->
     lists:usort(Payees) ++ lists:usort(Gateways);
 to_actors(blockchain_txn_token_burn_v1, T) ->
     [
-        {"payer", blockchain_txn_token_burn_v1:payer(T)},
-        {"payee", blockchain_txn_token_burn_v1:payee(T)}
+        {"payer", ?BIN_TO_B58(blockchain_txn_token_burn_v1:payer(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_token_burn_v1:payee(T))}
     ];
 to_actors(blockchain_txn_dc_coinbase_v1, T) ->
-    [{"payee", blockchain_txn_dc_coinbase_v1:payee(T)}];
+    [{"payee", ?BIN_TO_B58(blockchain_txn_dc_coinbase_v1:payee(T))}];
 to_actors(blockchain_txn_token_burn_exchange_rate_v1, _T) ->
     [];
 to_actors(blockchain_txn_payment_v2, T) ->
     ToActors = fun(Payment, Acc) ->
-        [{"payee", blockchain_payment_v2:payee(Payment)} | Acc]
+        [{"payee", ?BIN_TO_B58(blockchain_payment_v2:payee(Payment))} | Acc]
     end,
     lists:foldl(
         ToActors,
-        [{"payer", blockchain_txn_payment_v2:payer(T)}],
+        [{"payer", ?BIN_TO_B58(blockchain_txn_payment_v2:payer(T))}],
         blockchain_txn_payment_v2:payments(T)
     );
 to_actors(blockchain_txn_state_channel_open_v1, T) ->
     %% TODO: In v1 state channels we're assuminig the the opener is
     %% the payer of the DC in the state channel.
     Opener = blockchain_txn_state_channel_open_v1:owner(T),
-    [{"sc_opener", Opener}, {"payer", Opener}, {"owner", Opener}];
+    [
+        {"sc_opener", ?BIN_TO_B58(Opener)},
+        {"payer", ?BIN_TO_B58(Opener)},
+        {"owner", ?BIN_TO_B58(Opener)}
+    ];
 to_actors(blockchain_txn_state_channel_close_v1, T) ->
     %% NOTE: closer can be one of the clients of the state channel or the owner of the router
     %% if the state_channel expires
     SummaryToActors = fun(Summary, Acc) ->
         Receiver = blockchain_state_channel_summary_v1:client_pubkeybin(Summary),
-        [{"packet_receiver", Receiver} | Acc]
+        [{"packet_receiver", ?BIN_TO_B58(Receiver)} | Acc]
     end,
     Closer = blockchain_txn_state_channel_close_v1:closer(T),
     lists:foldl(
@@ -393,9 +412,9 @@ to_actors(blockchain_txn_state_channel_close_v1, T) ->
         %% client in the state channel can cause it to close
         %% to, but for v1 we expect this assumption to hold.
         [
-            {"sc_closer", Closer},
-            {"payee", Closer},
-            {"owner", blockchain_txn_state_channel_close_v1:state_channel_owner(T)}
+            {"sc_closer", ?BIN_TO_B58(Closer)},
+            {"payee", ?BIN_TO_B58(Closer)},
+            {"owner", ?BIN_TO_B58(blockchain_txn_state_channel_close_v1:state_channel_owner(T))}
         ],
         blockchain_state_channel_v1:summaries(
             blockchain_txn_state_channel_close_v1:state_channel(T)
@@ -404,63 +423,63 @@ to_actors(blockchain_txn_state_channel_close_v1, T) ->
 to_actors(blockchain_txn_gen_price_oracle_v1, _T) ->
     [];
 to_actors(blockchain_txn_price_oracle_v1, T) ->
-    [{"oracle", blockchain_txn_price_oracle_v1:public_key(T)}];
+    [{"oracle", ?BIN_TO_B58(blockchain_txn_price_oracle_v1:public_key(T))}];
 to_actors(blockchain_txn_transfer_hotspot_v1, T) ->
     [
-        {"gateway", blockchain_txn_transfer_hotspot_v1:gateway(T)},
-        {"payee", blockchain_txn_transfer_hotspot_v1:seller(T)},
-        {"payer", blockchain_txn_transfer_hotspot_v1:buyer(T)},
-        {"owner", blockchain_txn_transfer_hotspot_v1:buyer(T)}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v1:gateway(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v1:seller(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v1:buyer(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v1:buyer(T))}
     ];
 to_actors(blockchain_txn_transfer_hotspot_v2, T) ->
     [
-        {"gateway", blockchain_txn_transfer_hotspot_v2:gateway(T)},
-        {"owner", blockchain_txn_transfer_hotspot_v2:new_owner(T)}
+        {"gateway", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v2:gateway(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_transfer_hotspot_v2:new_owner(T))}
     ];
 to_actors(blockchain_txn_gen_validator_v1, T) ->
     [
-        {"validator", blockchain_txn_gen_validator_v1:address(T)},
-        {"payer", blockchain_txn_gen_validator_v1:owner(T)},
-        {"owner", blockchain_txn_gen_validator_v1:owner(T)}
+        {"validator", ?BIN_TO_B58(blockchain_txn_gen_validator_v1:address(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_gen_validator_v1:owner(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_gen_validator_v1:owner(T))}
     ];
 to_actors(blockchain_txn_stake_validator_v1, T) ->
     [
-        {"validator", blockchain_txn_stake_validator_v1:validator(T)},
-        {"payer", blockchain_txn_stake_validator_v1:owner(T)},
-        {"owner", blockchain_txn_stake_validator_v1:owner(T)}
+        {"validator", ?BIN_TO_B58(blockchain_txn_stake_validator_v1:validator(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_stake_validator_v1:owner(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_stake_validator_v1:owner(T))}
     ];
 to_actors(blockchain_txn_unstake_validator_v1, T) ->
     [
-        {"validator", blockchain_txn_unstake_validator_v1:address(T)},
-        {"payee", blockchain_txn_unstake_validator_v1:owner(T)},
-        {"owner", blockchain_txn_unstake_validator_v1:owner(T)}
+        {"validator", ?BIN_TO_B58(blockchain_txn_unstake_validator_v1:address(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_unstake_validator_v1:owner(T))},
+        {"owner", ?BIN_TO_B58(blockchain_txn_unstake_validator_v1:owner(T))}
     ];
 to_actors(blockchain_txn_transfer_validator_stake_v1, T) ->
     OldOwner = blockchain_txn_transfer_validator_stake_v1:old_owner(T),
     NewOwner = blockchain_txn_transfer_validator_stake_v1:new_owner(T),
     Owners =
         case NewOwner of
-            OldOwner -> [{"owner", OldOwner}];
-            <<>> -> [{"owner", OldOwner}];
-            _ -> [{"owner", NewOwner}, {"owner", OldOwner}]
+            OldOwner -> [{"owner", ?BIN_TO_B58(OldOwner)}];
+            <<>> -> [{"owner", ?BIN_TO_B58(OldOwner)}];
+            _ -> [{"owner", ?BIN_TO_B58(NewOwner)}, {"owner", ?BIN_TO_B58(OldOwner)}]
         end,
     [
-        {"validator", blockchain_txn_transfer_validator_stake_v1:old_validator(T)},
-        {"validator", blockchain_txn_transfer_validator_stake_v1:new_validator(T)},
-        {"payer", blockchain_txn_transfer_validator_stake_v1:new_owner(T)},
-        {"payee", blockchain_txn_transfer_validator_stake_v1:old_owner(T)}
+        {"validator", ?BIN_TO_B58(blockchain_txn_transfer_validator_stake_v1:old_validator(T))},
+        {"validator", ?BIN_TO_B58(blockchain_txn_transfer_validator_stake_v1:new_validator(T))},
+        {"payer", ?BIN_TO_B58(blockchain_txn_transfer_validator_stake_v1:new_owner(T))},
+        {"payee", ?BIN_TO_B58(blockchain_txn_transfer_validator_stake_v1:old_owner(T))}
     ] ++ Owners;
 to_actors(blockchain_txn_validator_heartbeat_v1, T) ->
     [
-        {"validator", blockchain_txn_validator_heartbeat_v1:address(T)}
+        {"validator", ?BIN_TO_B58(blockchain_txn_validator_heartbeat_v1:address(T))}
     ];
 to_actors(blockchain_txn_consensus_group_failure_v1, T) ->
     Members = [
-        {"consensus_failure_member", M}
+        {"consensus_failure_member", ?BIN_TO_B58(M)}
      || M <- blockchain_txn_consensus_group_failure_v1:members(T)
     ],
     FailedMembers = [
-        {"consensus_failure_failed_member", M}
+        {"consensus_failure_failed_member", ?BIN_TO_B58(M)}
      || M <- blockchain_txn_consensus_group_failure_v1:failed_members(T)
     ],
     Members ++ FailedMembers.
