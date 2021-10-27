@@ -78,7 +78,7 @@ load_block(Conn, _Hash, Block, _Sync, Ledger, State = #state{}) ->
             "consensus_member"
         ],
         fun({_Role, Key}, Acc) ->
-            maps:put(Key, true, Acc)
+            maps:put(?B58_TO_BIN(Key), true, Acc)
         end,
         #{},
         Block

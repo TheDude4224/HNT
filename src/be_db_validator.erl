@@ -59,12 +59,13 @@ load_block(Conn, _Hash, Block, _Sync, Ledger, State = #state{}) ->
     %% Collect all validator affected by transactions in the block itself
     BlockValidators = be_db_follower:fold_actors(
         ["validator"],
-        fun({_Role, Key}, Acc) ->
+        fun({_Role, B58Key}, Acc) ->
+            Key = ?B58_TO_BIN(B58Key),
             case blockchain_ledger_v1:get_validator(Key, Ledger) of
                 {ok, Entry} ->
                     maps:put(Key, Entry, Acc);
                 {error, not_found} ->
-                    lager:warning("Failed to find validator: ~p", [?BIN_TO_B58(Key)]),
+                    lager:warning("Failed to find validator: ~p", [B58Key]),
                     Acc
             end
         end,
