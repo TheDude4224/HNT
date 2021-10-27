@@ -66,7 +66,7 @@ q_insert_transaction_actors(Height, Txn, TxnJsonFun) ->
 q_insert_block_transaction_actors(Block, TxnJsonFun) ->
     Height = blockchain_block_v1:height(Block),
     Txns = blockchain_block_v1:transactions(Block),
-    TxnQueries = blockchain_utils:pmap(
+    TxnQueries = lists:map(
         fun(Txn) ->
             q_insert_transaction_actors(Height, Txn, TxnJsonFun)
         end,
@@ -167,11 +167,11 @@ to_actor_fields(blockchain_txn_state_channel_close_v1, Role, Actor, Fields, #{cl
         end,
     StateChannel = maps:get(<<"state_channel">>, Fields, #{}),
     Fields#{<<"state_channel">> => StateChannel#{<<"summaries">> => Summaries}};
-to_actor_fields(blockchain_txn_payment_v2, Role, Actor, Fields, #{payments := Payments}) ->
+to_actor_fields(blockchain_txn_payment_v2, Role, Actor, Fields, #{payments := CtxPayments}) ->
     Payments =
         case Role of
             "payer" -> [];
-            "payee" -> maps:get(Actor, Payments, [])
+            "payee" -> maps:get(Actor, CtxPayments, [])
         end,
     Fields#{<<"payments">> => Payments};
 to_actor_fields(_Type, _Role, _Actor, Fields, _Ctx) ->
