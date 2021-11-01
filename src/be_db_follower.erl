@@ -124,6 +124,12 @@ maybe_log_duration(Item, Start) ->
             ok
     end.
 
+-spec fold_actors(
+    Roles :: [string()],
+    fun(({Role :: string(), Address :: string()}, Acc) -> Acc),
+    Acc,
+    Block :: blockchain_block:block()
+) -> Acc when Acc :: any().
 fold_actors(Roles, Fun, InitAcc, Block) ->
     Txns = blockchain_block_v1:transactions(Block),
     %% Fetch actor keys that relate to accounts from each transaction's actors

@@ -123,7 +123,7 @@ prepare_actor_fields_ctx(Type, #{<<"rewards">> := Rewards}) when
                 end,
             {GWAcc, ACAcc}
         end,
-        {[], []},
+        {#{}, #{}},
         Rewards
     ),
     #{gateways => Gateways, accounts => Accounts};
